@@ -8,9 +8,12 @@
  *   core 3  EMU10K1 (SB Live!)                   64-voice wavetable, 8-point interp, smooth reverb
  *
  * The era slider sets an equal-power crossfade between adjacent cores.
- * The FM model follows the structure of the Yamaha OPL family (log-sin / exp tables,
- * 9-bit attenuation envelopes, KSL, feedback, LFOs) but is an independent implementation.
+ * The FM cores run a cycle-accurate YMF262 emulation (a JavaScript port of Nuked OPL3, LGPL-2.1,
+ * see nuked-opl3.js) at the chip's native 49,716 Hz, through a floating-point DAC model, then a
+ * band-limited resampler to the AudioContext rate.
  */
+
+import { OPL3 } from './nuked-opl3.js';
 
 const SR = sampleRate;
 const SUB = 32;                 // control-rate sub-block
@@ -35,84 +38,13 @@ class Chan {
 }
 
 // ======================================================================
-//  OPL-style FM
+//  FM: cycle-accurate YMF262 (Nuked OPL3 port) driven through its registers,
+//  the way the DOS/Windows MIDI drivers did it.
 // ======================================================================
-const OPL_RATE = 49716;
-const MT = [1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 20, 24, 24, 30, 30];
-const KSLROM = [0, 32, 40, 45, 48, 51, 53, 55, 56, 58, 59, 60, 61, 62, 63, 64];
-const KSLSHIFT = [8, 1, 2, 0];
-const LOGSIN = new Int32Array(256);
-const EXPT = new Int32Array(256);
-for (let i = 0; i < 256; i++) {
-  LOGSIN[i] = Math.round(-Math.log2(Math.sin((i + 0.5) * Math.PI / 512)) * 256);
-  EXPT[i] = Math.round(Math.pow(2, (255 - i) / 256) * 1024);
-}
-// envelope speed (attenuation units per chip sample) for effective rate 0..63
-const SPEED = new Float64Array(64);
-for (let r = 0; r < 64; r++) SPEED[r] = r < 4 ? 0 : 2.617e-4 * Math.pow(2, (r >> 2) - 1) * (4 + (r & 3)) / 4;
+const OPL_RATE = 49716;                  // 14.31818 MHz / 288 — the chip's native sample rate
+const OP_OFF = [0, 1, 2, 8, 9, 10, 16, 17, 18];
 
-function opOut(wf, phase, env) {
-  phase &= 1023;
-  let out, neg = 0;
-  switch (wf) {
-    case 0:
-      if (phase & 0x200) neg = 1;
-      out = (phase & 0x100) ? LOGSIN[(phase & 0xff) ^ 0xff] : LOGSIN[phase & 0xff];
-      break;
-    case 1:
-      if (phase & 0x200) out = 0x1000;
-      else out = (phase & 0x100) ? LOGSIN[(phase & 0xff) ^ 0xff] : LOGSIN[phase & 0xff];
-      break;
-    case 2:
-      out = (phase & 0x100) ? LOGSIN[(phase & 0xff) ^ 0xff] : LOGSIN[phase & 0xff];
-      break;
-    case 3:
-      out = (phase & 0x100) ? 0x1000 : LOGSIN[phase & 0xff];
-      break;
-    case 4:
-      if ((phase & 0x300) === 0x100) neg = 1;
-      if (phase & 0x200) out = 0x1000;
-      else if (phase & 0x80) out = LOGSIN[((phase ^ 0xff) << 1) & 0xff];
-      else out = LOGSIN[(phase << 1) & 0xff];
-      break;
-    case 5:
-      if (phase & 0x200) out = 0x1000;
-      else if (phase & 0x80) out = LOGSIN[((phase ^ 0xff) << 1) & 0xff];
-      else out = LOGSIN[(phase << 1) & 0xff];
-      break;
-    case 6:
-      if (phase & 0x200) neg = 1;
-      out = 0;
-      break;
-    default:
-      if (phase & 0x200) { neg = 1; phase = (phase & 0x1ff) ^ 0x1ff; }
-      out = phase << 3;
-  }
-  let level = out + (env << 3);
-  if (level > 0x1fff) level = 0x1fff;
-  const v = (EXPT[level & 0xff] << 1) >> (level >> 8);
-  return neg ? ~v : v;
-}
-
-class FMOp {
-  constructor() {
-    this.p = null; this.phase = 0; this.inc = 0; this.att = 511; this.stage = 4;
-    this.aS = 0; this.dS = 0; this.rS = 0; this.instant = false; this.slv = 0;
-    this.base = 0; this.prev0 = 0; this.prev1 = 0; this.ws = 0; this.am = 0; this.vib = 0; this.egt = 0;
-  }
-}
-
-class FMVoice {
-  constructor() {
-    this.m = new FMOp(); this.c = new FMOp();
-    this.active = false; this.on = false; this.sus = false;
-    this.ch = 0; this.note = 0; this.pitch = 60; this.vel = 0; this.age = 0;
-    this.fb = 0; this.cnt = 0; this.L = 1; this.R = 1; this.fixed = false; this.offset = 0; this.detune = 0;
-    this.fnum = 0; this.block = 0;
-  }
-}
-
-function dacFloat(x) {               // YM3014-style floating point DAC: 10-bit mantissa
+function dacFloat(x) {                   // YM3014 / YAC512 floating-point DAC: 10-bit mantissa, 3-bit exponent
   const a = x < 0 ? -x : x;
   if (a < 512) return x;
   let sh = 1;
@@ -120,29 +52,90 @@ function dacFloat(x) {               // YM3014-style floating point DAC: 10-bit 
   return ((x >> sh) << sh);
 }
 
+// Band-limited polyphase resampler: native chip rate → AudioContext rate.
+class Resampler {
+  constructor(inRate, outRate, taps = 64, phases = 1024) {
+    this.step = inRate / outRate; this.T = taps; this.P = phases;
+    const fc = 0.5 * Math.min(1, outRate / inRate) * 0.9;     // cutoff, cycles per input sample
+    this.h = new Float32Array(phases * taps);
+    for (let p = 0; p < phases; p++) {
+      let sum = 0;
+      for (let k = 0; k < taps; k++) {
+        const x = (k - taps / 2 + 1) - p / phases;
+        const s = Math.abs(x) < 1e-9 ? 2 * fc : Math.sin(2 * Math.PI * fc * x) / (Math.PI * x);
+        const n = (x + taps / 2) / taps;                         // 0..1 across the window
+        const w = n <= 0 || n >= 1 ? 0 : 0.35875 - 0.48829 * Math.cos(2 * Math.PI * n) + 0.14128 * Math.cos(4 * Math.PI * n) - 0.01168 * Math.cos(6 * Math.PI * n);
+        this.h[p * taps + k] = s * w; sum += s * w;
+      }
+      for (let k = 0; k < taps; k++) this.h[p * taps + k] /= sum;
+    }
+    this.bL = new Float32Array(taps * 2); this.bR = new Float32Array(taps * 2);
+    this.idx = 0; this.frac = 0;
+  }
+  push(l, r) {
+    const T = this.T, i = this.idx;
+    this.bL[i] = this.bL[i + T] = l; this.bR[i] = this.bR[i + T] = r;
+    this.idx = i + 1 === T ? 0 : i + 1;
+  }
+  // returns how many new input samples are needed before the next output
+  advance() { this.frac += this.step; const n = Math.floor(this.frac); this.frac -= n; return n; }
+  out(o) {
+    const T = this.T, base = this.idx, h = this.h, hp = ((this.frac * this.P) | 0) * T;
+    let l = 0, r = 0;
+    for (let k = 0; k < T; k++) { const c = h[hp + k]; l += this.bL[base + k] * c; r += this.bR[base + k] * c; }
+    o[0] = l; o[1] = r;
+  }
+}
+
+class FMVoice {
+  constructor(c) {
+    this.c = c;                          // chip channel 0..17
+    this.hi = c >= 9 ? 0x100 : 0; this.ch = c % 9; this.mop = OP_OFF[this.ch]; this.cop = this.mop + 3;
+    this.active = false; this.on = false; this.sus = false;
+    this.midi = 0; this.note = 0; this.vel = 0; this.age = 0; this.pv = null;
+    this.pitch = 60; this.fixed = false; this.offset = 0; this.detune = 0;
+    this.fnum = 0; this.block = 0; this.pan = 0x30; this.offTick = -1;
+  }
+}
+
 class OPLCore {
   constructor(synth, kind) {
     this.s = synth; this.kind = kind;
     this.nv = kind ? 18 : 9;
     this.stereo = kind === 1;
-    this.wsMask = kind ? 7 : 3;
-    this.voices = []; for (let i = 0; i < this.nv; i++) this.voices.push(new FMVoice());
-    this.bank = null;
-    this.step = OPL_RATE / SR; this.pos = 0;
-    this.pL = 0; this.pR = 0; this.cL = 0; this.cR = 0;
-    this.tp = 0; this.vp = 0; this.trem = 0; this.vibR = 1;
-    this.age = 0;
+    this.chip = new OPL3();
+    this.voices = []; for (let i = 0; i < this.nv; i++) this.voices.push(new FMVoice(i));
+    this.bank = null; this.age = 0;
+    this.deferred = [];                  // key-ons held for one chip sample after a key-off
+    this.tick = 0;
+    this.rs = new Resampler(OPL_RATE, SR);
+    this.cbuf = [0, 0]; this.obuf = [0, 0];
     this.lpA = 1 - Math.exp(-2 * Math.PI * (kind ? 14000 : 8500) / SR);
     this.lp2A = 1 - Math.exp(-2 * Math.PI * (kind ? 18000 : 12000) / SR);
     this.lL = 0; this.lR = 0; this.l2L = 0; this.l2R = 0;
     this.hiss = kind ? 0.00004 : 0.00016;
-    this.hum = 0; this.humP = 0;
     this.seed = 12345 + kind;
     this.analog = 1;
     this.scale = 2.6 / 32768;
+    this.initChip();
+  }
+  w(reg, v) { this.chip.writeReg(reg, v & 0xff); }
+  initChip() {
+    this.chip.reset();
+    if (this.kind === 1) this.w(0x105, 0x01);    // OPL3 mode (NEW=1); OPL2 core stays in OPL2-compatible mode
+    this.w(0x01, 0x20);                           // waveform select enable
+    this.w(0xBD, 0xC0);                           // deep tremolo + deep vibrato, melodic mode
+    this.w(0x08, 0x00);
   }
   setBank(b) { this.reset(); this.bank = b; }
-  reset() { for (const v of this.voices) { v.active = false; v.on = false; v.m.stage = 4; v.c.stage = 4; v.m.att = v.c.att = 511; } }
+  reset() {
+    for (const v of this.voices) {
+      v.active = false; v.on = false;
+      this.w(v.hi + 0xB0 + v.ch, 0);
+      this.w(v.hi + 0x80 + v.mop, 0x0f); this.w(v.hi + 0x80 + v.cop, 0x0f);   // fastest release
+    }
+    this.deferred.length = 0;
+  }
   activeCount() { let n = 0; for (const v of this.voices) if (v.active) n++; return n; }
 
   alloc() {
@@ -157,168 +150,113 @@ class OPLCore {
   noteOn(c, note, vel) {
     if (!this.bank) return;
     const ch = this.s.ch[c];
-    let patch;
-    if (ch.drum) { patch = this.bank.drums[note]; if (!patch) return; }
-    else patch = this.bank.melodic[ch.program & 127];
+    const patch = ch.drum ? this.bank.drums[note] : this.bank.melodic[ch.program & 127];
     if (!patch) return;
-    const n = patch.voices.length;
-    for (let k = 0; k < n; k++) {
+    for (let k = 0; k < patch.voices.length; k++) {
       const pv = patch.voices[k];
       const v = this.alloc();
+      // the chip only retriggers if it sees at least one sample with the key released
+      const wasKeyed = v.active && (v.on || v.offTick === this.tick);
+      this.dropDeferred(v);
+      if (v.active) this.w(v.hi + 0xB0 + v.ch, (v.block << 2) | (v.fnum >> 8));      // key off (steal)
       v.active = true; v.on = true; v.sus = false;
-      v.ch = c; v.note = note; v.vel = vel; v.age = ++this.age;
+      v.midi = c; v.note = note; v.vel = vel; v.age = ++this.age; v.pv = pv;
       v.fixed = !!patch.fixed;
       v.pitch = patch.fixed ? patch.fixedNote : note;
       v.offset = pv.offset || 0;
       v.detune = k === 1 ? (patch.detune || 0) : 0;
-      v.fb = pv.fb; v.cnt = pv.cnt;
-      this.loadOp(v.m, pv.m); this.loadOp(v.c, pv.c);
-      if (this.stereo) {
-        const p = ch.pan;
-        v.L = p <= 85 ? 1 : 0; v.R = p >= 43 ? 1 : 0;
-      } else { v.L = 1; v.R = 1; }
-      this.freq(v); this.level(v);
-      for (const op of [v.m, v.c]) { op.phase = 0; op.stage = 0; op.prev0 = 0; op.prev1 = 0; }
+      const op20 = (p) => (p.am << 7) | (p.vib << 6) | (p.egt << 5) | (p.ksr << 4) | p.mult;
+      for (const [off, p] of [[v.mop, pv.m], [v.cop, pv.c]]) {
+        this.w(v.hi + 0x20 + off, op20(p));
+        this.w(v.hi + 0x60 + off, (p.ar << 4) | p.dr);
+        this.w(v.hi + 0x80 + off, (p.sl << 4) | p.rr);
+        this.w(v.hi + 0xE0 + off, p.ws);
+      }
+      this.panOf(v);
+      this.level(v);
+      this.freq(v, false);
+      const keyOn = [v.hi + 0xB0 + v.ch, 0x20 | (v.block << 2) | (v.fnum >> 8)];
+      if (wasKeyed) this.deferred.push([v, keyOn[0], keyOn[1]]); else this.w(keyOn[0], keyOn[1]);
     }
   }
-  loadOp(op, p) {
-    op.p = p; op.ws = p.ws & this.wsMask; op.am = p.am; op.vib = p.vib; op.egt = p.egt;
-    op.slv = p.sl === 15 ? 496 : p.sl << 4;
+  panOf(v) {
+    let pan = 0x30;
+    if (this.stereo) { const p = this.s.ch[v.midi].pan; pan = p < 43 ? 0x10 : p > 85 ? 0x20 : 0x30; }
+    v.pan = pan;
+    this.w(v.hi + 0xC0 + v.ch, pan | (v.pv.fb << 1) | v.pv.cnt);
   }
-  freq(v) {
-    const ch = this.s.ch[v.ch];
+  freq(v, write = true) {
+    const ch = this.s.ch[v.midi];
     let n = v.pitch + v.offset + v.detune;
     if (!v.fixed) n += ch.bend * ch.bendRange;
     let f = 440 * Math.pow(2, (n - 69) / 12);
     if (f < 1) f = 1;
     let block = 0, fnum = 0;
-    for (block = 0; block < 8; block++) {
-      fnum = Math.round(f * Math.pow(2, 20 - block) / OPL_RATE);
-      if (fnum < 1024) break;
-    }
+    for (block = 0; block < 8; block++) { fnum = Math.round(f * Math.pow(2, 20 - block) / OPL_RATE); if (fnum < 1024) break; }
     if (block > 7) { block = 7; fnum = 1023; }
     v.fnum = fnum; v.block = block;
-    const ksvFull = (block << 1) | ((fnum >> 9) & 1);
-    let ksl = (KSLROM[fnum >> 6] << 2) - ((8 - block) << 5);
-    if (ksl < 0) ksl = 0;
-    for (const op of [v.m, v.c]) {
-      const p = op.p;
-      op.inc = ((fnum << block) * MT[p.mult]) / 2;
-      const ksv = p.ksr ? ksvFull : ksvFull >> 2;
-      const rA = p.ar ? Math.min(63, p.ar * 4 + ksv) : 0;
-      const rD = p.dr ? Math.min(63, p.dr * 4 + ksv) : 0;
-      const rR = p.rr ? Math.min(63, p.rr * 4 + ksv) : 0;
-      op.instant = rA >= 60; op.aS = SPEED[rA] / 5.9; op.dS = SPEED[rD]; op.rS = SPEED[rR];
-      op.kslAtt = ksl >> KSLSHIFT[p.ksl];
-    }
+    this.w(v.hi + 0xA0 + v.ch, fnum & 0xff);
+    if (write) this.w(v.hi + 0xB0 + v.ch, (v.on ? 0x20 : 0) | (block << 2) | (fnum >> 8));
   }
   level(v) {
-    const ch = this.s.ch[v.ch];
+    const ch = this.s.ch[v.midi];
     const vel = Math.max(1, v.vel) / 127;
     const vol = Math.max(1, ch.vol * ch.expr) / 16129;
     const db = -40 * Math.log10(vel) * 0.55 - 40 * Math.log10(vol) * 0.75;
-    const add = Math.min(63, Math.round(db / 0.75));
-    v.c.base = Math.min(511, ((Math.min(63, v.c.p.tl + add)) << 2) + v.c.kslAtt);
-    v.m.base = Math.min(511, ((Math.min(63, v.m.p.tl + (v.cnt ? add : 0))) << 2) + v.m.kslAtt);
+    let add = Math.min(63, Math.round(db / 0.75));
+    if (this.s.mute[v.midi]) add = 63;
+    const p = v.pv;
+    this.w(v.hi + 0x40 + v.cop, (p.c.ksl << 6) | Math.min(63, p.c.tl + add));
+    this.w(v.hi + 0x40 + v.mop, (p.m.ksl << 6) | Math.min(63, p.m.tl + (p.cnt ? add : 0)));
   }
-  release(v) { v.on = false; v.sus = false; if (v.m.stage < 4) v.m.stage = 3; if (v.c.stage < 4) v.c.stage = 3; }
+  release(v) { v.on = false; v.sus = false; v.offTick = this.tick; this.dropDeferred(v); this.w(v.hi + 0xB0 + v.ch, (v.block << 2) | (v.fnum >> 8)); }
+  dropDeferred(v) { if (this.deferred.length) this.deferred = this.deferred.filter(d => d[0] !== v); }
   noteOff(c, note) {
     const ch = this.s.ch[c];
-    for (const v of this.voices) if (v.active && v.on && v.ch === c && v.note === note) {
+    for (const v of this.voices) if (v.active && v.on && v.midi === c && v.note === note) {
       if (ch.sustain) v.sus = true; else this.release(v);
     }
   }
-  sustainOff(c) { for (const v of this.voices) if (v.active && v.on && v.sus && v.ch === c) this.release(v); }
+  sustainOff(c) { for (const v of this.voices) if (v.active && v.on && v.sus && v.midi === c) this.release(v); }
   allOff(c, hard) {
-    for (const v of this.voices) if (v.active && v.ch === c) {
-      if (hard) { v.active = false; v.m.stage = v.c.stage = 4; v.m.att = v.c.att = 511; } else this.release(v);
+    for (const v of this.voices) if (v.active && v.midi === c) {
+      this.release(v);
+      if (hard) { this.w(v.hi + 0x80 + v.mop, 0x0f); this.w(v.hi + 0x80 + v.cop, 0x0f); }
     }
   }
-  pitch(c) { for (const v of this.voices) if (v.active && v.ch === c) { this.freq(v); this.level(v); } }
-  ctrl(c) {
-    const ch = this.s.ch[c];
-    for (const v of this.voices) if (v.active && v.ch === c) {
-      this.level(v);
-      if (this.stereo) { const p = ch.pan; v.L = p <= 85 ? 1 : 0; v.R = p >= 43 ? 1 : 0; }
-    }
-  }
+  pitch(c) { for (const v of this.voices) if (v.active && v.midi === c) this.freq(v); }
+  ctrl(c) { for (const v of this.voices) if (v.active && v.midi === c) { this.level(v); this.panOf(v); } }
 
-  static eg(op) {
-    switch (op.stage) {
-      case 0:
-        if (op.instant) op.att = 0; else op.att -= (op.att + 1) * op.aS;
-        if (op.att <= 0.5) { op.att = 0; op.stage = 1; }
-        break;
-      case 1:
-        op.att += op.dS;
-        if (op.att >= op.slv) { op.att = op.slv; op.stage = 2; }
-        break;
-      case 2:
-        if (!op.egt) { op.att += op.rS; if (op.att >= 511) op.att = 511; }
-        break;
-      case 3:
-        op.att += op.rS;
-        if (op.att >= 511) { op.att = 511; op.stage = 4; }
-        break;
-    }
-  }
-
-  tick() {
-    // LFOs (deep tremolo 4.8 dB, deep vibrato 14 cents)
-    this.tp += 3.7 / OPL_RATE; if (this.tp >= 1) this.tp -= 1;
-    this.vp += 6.07 / OPL_RATE; if (this.vp >= 1) this.vp -= 1;
-    const tri = 1 - Math.abs(2 * this.tp - 1);
-    const trem = (tri * 26) | 0;
-    const vtri = 2 * Math.abs(2 * this.vp - 1) - 1;
-    const vibR = 1 + vtri * 0.0081;
-    const mute = this.s.mute;
-    let L = 0, R = 0;
-    const vs = this.voices;
-    for (let i = 0; i < vs.length; i++) {
-      const v = vs[i];
-      if (!v.active) continue;
-      const m = v.m, c = v.c;
-      OPLCore.eg(m); OPLCore.eg(c);
-      let em = (m.att | 0) + m.base + (m.am ? trem : 0); if (em > 511) em = 511;
-      let ec = (c.att | 0) + c.base + (c.am ? trem : 0); if (ec > 511) ec = 511;
-      m.phase += m.vib ? m.inc * vibR : m.inc; if (m.phase >= 1048576) m.phase %= 1048576;
-      c.phase += c.vib ? c.inc * vibR : c.inc; if (c.phase >= 1048576) c.phase %= 1048576;
-      const fbIn = v.fb ? (m.prev0 + m.prev1) >> (9 - v.fb) : 0;
-      const mo = opOut(m.ws, (m.phase >> 10) + fbIn, em);
-      m.prev1 = m.prev0; m.prev0 = mo;
-      let out;
-      if (v.cnt) out = mo + opOut(c.ws, c.phase >> 10, ec);
-      else out = opOut(c.ws, (c.phase >> 10) + mo, ec);
-      if (!mute[v.ch]) { if (v.L) L += out; if (v.R) R += out; }
-      if (c.stage === 4 && (!v.cnt || m.stage === 4)) { v.active = false; v.on = false; }
-    }
-    if (L > 32767) L = 32767; else if (L < -32768) L = -32768;
-    if (R > 32767) R = 32767; else if (R < -32768) R = -32768;
-    this.pL = this.cL; this.pR = this.cR;
-    this.cL = dacFloat(L) * this.scale;
-    this.cR = dacFloat(R) * this.scale;
+  chipSample() {
+    this.chip.generate(this.cbuf);
+    this.tick++;
+    if (this.deferred.length) { for (const [, r, d] of this.deferred) this.w(r, d); this.deferred.length = 0; }
+    if (this.stereo) this.rs.push(dacFloat(this.cbuf[0]) * this.scale, dacFloat(this.cbuf[1]) * this.scale);
+    else { const m = dacFloat(this.cbuf[0]) * this.scale; this.rs.push(m, m); }   // YM3812 → YM3014: one mono DAC
   }
 
   render(oL, oR, n) {
-    const a = this.lpA * this.analog + (1 - this.analog), a2 = this.lp2A * this.analog + (1 - this.analog);
+    const an = this.analog;
+    const a = this.lpA * an + (1 - an), a2 = this.lp2A * an + (1 - an);
+    const o = this.obuf;
     for (let i = 0; i < n; i++) {
-      this.pos += this.step;
-      while (this.pos >= 1) { this.pos -= 1; this.tick(); }
-      const f = this.pos;
-      let l = this.pL + (this.cL - this.pL) * f;
-      let r = this.pR + (this.cR - this.pR) * f;
+      for (let k = this.rs.advance(); k > 0; k--) this.chipSample();
+      this.rs.out(o);
       // analog output stage: two gentle poles + hiss
-      this.lL += a * (l - this.lL); this.l2L += a2 * (this.lL - this.l2L);
-      this.lR += a * (r - this.lR); this.l2R += a2 * (this.lR - this.l2R);
+      this.lL += a * (o[0] - this.lL); this.l2L += a2 * (this.lL - this.l2L);
+      this.lR += a * (o[1] - this.lR); this.l2R += a2 * (this.lR - this.l2R);
       this.seed = (this.seed * 1103515245 + 12345) & 0x7fffffff;
-      const nz = ((this.seed / 0x7fffffff) - 0.5) * this.hiss * this.analog;
+      const nz = ((this.seed / 0x7fffffff) - 0.5) * this.hiss * an;
       oL[i] = this.l2L + nz; oR[i] = this.l2R + nz;
     }
-    // meters
+    // free finished voices; meters from the carrier's real envelope output
     const met = this.s.meter;
-    for (const v of this.voices) if (v.active) {
-      const g = Math.pow(10, -((v.c.att | 0) + v.c.base) * 0.1875 / 20);
-      if (g > met[v.ch]) met[v.ch] = g;
+    for (const v of this.voices) {
+      if (!v.active) continue;
+      const chn = this.chip.channel[v.c], car = chn.slotz[1], mod = chn.slotz[0];
+      if (!v.on && (car.eg_rout & 0x1f8) === 0x1f8 && (!v.pv.cnt || (mod.eg_rout & 0x1f8) === 0x1f8)) { v.active = false; continue; }
+      const g = Math.pow(10, -Math.min(511, car.eg_out) * 0.1875 / 20);
+      if (g > met[v.midi]) met[v.midi] = g;
     }
   }
 }
@@ -727,7 +665,7 @@ class BlastaProcessor extends AudioWorkletProcessor {
       case 'era': this.setEra(m.v); break;
       case 'fmbank': this.cores[0].setBank(m.bank); this.cores[1].setBank(m.bank); break;
       case 'sfbank': this.cores[m.core].setBank(m.bank); break;
-      case 'mute': this.mute.set(m.v); break;
+      case 'mute': this.mute.set(m.v); for (let c = 0; c < 16; c++) { this.cores[0].ctrl(c); this.cores[1].ctrl(c); } break;
       case 'master': this.master = m.v; break;
       case 'analog': this.cores[0].analog = this.cores[1].analog = m.v; break;
       case 'panic': this.panic(); break;
