@@ -107,7 +107,7 @@ select { background: #fff; border: 1px solid var(--dk); box-shadow: inset 1px 1p
 
 /* ---------- banks ---------- */
 .banks { grid-column: 1 / -1; }
-.bankrow { display: grid; grid-template-columns: 120px 1fr auto auto; gap: 8px; align-items: center; padding: 3px 0; }
+.bankrow { display: grid; grid-template-columns: 120px 1fr auto auto auto; gap: 8px; align-items: center; padding: 3px 0; }
 .bankrow .bk { font-weight: bold; }
 .bstat { font-family: "Lucida Console", monospace; font-size: 11px; background: #fff; padding: 2px 6px; box-shadow: inset 1px 1px var(--lo), inset -1px -1px var(--hi);
   overflow: hidden; white-space: nowrap; text-overflow: ellipsis; min-width: 0; }

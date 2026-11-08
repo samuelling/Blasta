@@ -49,8 +49,8 @@ async function initAudio() {
   post({ t: 'era', v: app.era });
   post({ t: 'master', v: +$('vol').value });
   setStatus('FM cards ready. Burning wavetable ROMs…');
-  loadBuiltinSF2();
   player.load(demoSong());
+  await restoreSaved();
 }
 const post = (m, tr) => node && node.port.postMessage(m, tr || []);
 const sendNow = (st, d1, d2 = 0) => post({ t: 'now', ev: [[st, d1, d2]] });
@@ -92,18 +92,55 @@ async function fetchWithProgress(url, onp) {
   return out.buffer;
 }
 
-async function loadBuiltinSF2() {
+// ---- banks you load are kept in this browser (IndexedDB) and restored on every visit ----
+const store = {
+  db: null,
+  open() {
+    return this.db || (this.db = new Promise((res, rej) => {
+      const r = indexedDB.open('blasta', 1);
+      r.onupgradeneeded = () => r.result.createObjectStore('banks');
+      r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+    }));
+  },
+  async op(mode, fn) {
+    const db = await this.open();
+    return new Promise((res, rej) => {
+      const q = fn(db.transaction('banks', mode).objectStore('banks'));
+      q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error);
+    });
+  },
+  get(k) { return this.op('readonly', s => s.get(k)).catch(() => null); },
+  put(k, v) { return this.op('readwrite', s => s.put(v, k)); },
+  del(k) { return this.op('readwrite', s => s.delete(k)).catch(() => {}); },
+};
+const PIN = ' · 📌 saved in this browser';
+const BUDGET = { 2: 'awe', 3: 'live' };
+
+async function restoreSaved() {
+  const [fm, s2, s3] = await Promise.all([store.get('fm'), store.get('sf2'), store.get('sf3')]);
+  if (fm) await loadOP2(fm.blob, fm.name, { save: false });
+  const need = [];
+  for (const [core, saved] of [[2, s2], [3, s3]]) {
+    if (saved) { $('budget' + core).checked = saved.budget !== 'raw'; await loadUserSF2(saved.blob, saved.name, core, { save: false, jump: false }); }
+    else need.push(BUDGET[core]);
+  }
+  if (need.length) await loadBuiltinSF2(need);
+  else setStatus('All four cards ready (your saved banks).');
+}
+
+async function loadBuiltinSF2(budgets = ['awe', 'live']) {
+  const cores = budgets.map(b => b === 'awe' ? 2 : 3);
   try {
-    $('st2').textContent = $('st3').textContent = 'downloading GeneralUser GS…';
+    for (const c of cores) $('st' + c).textContent = 'downloading GeneralUser GS…';
     const buf = await fetchWithProgress(BUILTIN_SF2, (f) => prog(f * 0.5));
-    $('st2').textContent = $('st3').textContent = 'burning ROM…';
-    const r = await burn(buf, ['awe', 'live'], (stage, p) => prog(0.5 + (stage === 'awe' ? p * 0.2 : 0.2 + p * 0.3)));
-    installSF(2, r.banks.awe, 'GeneralUser GS → AWE-style ROM');
-    installSF(3, r.banks.live, 'GeneralUser GS → Live!-style bank');
+    for (const c of cores) $('st' + c).textContent = 'burning ROM…';
+    const r = await burn(buf, budgets, (stage, p) => prog(0.5 + p * 0.5));
+    if (r.banks.awe) installSF(2, r.banks.awe, 'GeneralUser GS → AWE-style ROM');
+    if (r.banks.live) installSF(3, r.banks.live, 'GeneralUser GS → Live!-style bank');
     prog(1); setTimeout(() => prog(0), 800);
     setStatus('All four cards ready.');
   } catch (err) {
-    $('st2').textContent = $('st3').textContent = 'failed: ' + err.message;
+    for (const c of cores) $('st' + c).textContent = 'failed: ' + err.message;
     setStatus('Could not load the wavetable bank — load your own .SF2 below.');
   }
 }
@@ -112,29 +149,50 @@ function installSF(core, bank, label) {
   post({ t: 'sfbank', core, bank }, [bank.pool.buffer]);
   $('st' + core).textContent = `${label} · ${mb(bytes)} of samples`;
 }
-async function loadUserSF2(file, core) {
-  const budget = $('budget' + core).checked ? (core === 2 ? 'awe' : 'live') : 'raw';
-  $('st' + core).textContent = 'reading ' + file.name + '…';
+async function saveBank(key, rec, statusEl) {
   try {
-    const r = await burn(await file.arrayBuffer(), [budget], (s, p) => prog(p));
-    const bank = r.banks[budget];
-    installSF(core, bank, file.name + (budget === 'raw' ? '' : budget === 'awe' ? ' → AWE-style' : ' → Live!-style'));
+    if (navigator.storage && navigator.storage.persist) navigator.storage.persist();   // ask the browser not to evict it
+    await store.put(key, rec);
+    statusEl.textContent += PIN;
+  } catch (err) {
+    statusEl.textContent += ' · not saved (' + (err.name === 'QuotaExceededError' ? 'browser storage full' : err.message) + ')';
+  }
+}
+async function loadUserSF2(blob, name, core, { save = true, jump = true } = {}) {
+  const budget = $('budget' + core).checked ? BUDGET[core] : 'raw';
+  $('st' + core).textContent = 'reading ' + name + '…';
+  try {
+    const r = await burn(await blob.arrayBuffer(), [budget], (s, p) => prog(p));
+    installSF(core, r.banks[budget], name + (budget === 'raw' ? '' : budget === 'awe' ? ' → AWE-style' : ' → Live!-style'));
     prog(0);
-    setEra(core);
+    if (save) await saveBank('sf' + core, { name, budget, blob }, $('st' + core));
+    else $('st' + core).textContent += PIN;
+    if (jump) setEra(core);
   } catch (err) { $('st' + core).textContent = 'error: ' + err.message; }
 }
-async function loadOP2(file) {
+async function loadOP2(blob, name, { save = true } = {}) {
   try {
-    const bank = parseOP2(await file.arrayBuffer());
+    const bank = parseOP2(await blob.arrayBuffer());
     post({ t: 'fmbank', bank });
-    $('stFM').textContent = file.name;
-    if (app.era > 1.5) setEra(1);
+    $('stFM').textContent = name;
+    if (save) { await saveBank('fm', { name, blob }, $('stFM')); if (app.era > 1.5) setEra(1); }
+    else $('stFM').textContent += PIN;
   } catch (err) { $('stFM').textContent = 'error: ' + err.message; }
 }
-$('fileOP2').onchange = (e) => e.target.files[0] && loadOP2(e.target.files[0]);
-$('fileSF2a').onchange = (e) => e.target.files[0] && loadUserSF2(e.target.files[0], 2);
-$('fileSF2b').onchange = (e) => e.target.files[0] && loadUserSF2(e.target.files[0], 3);
-$('btnFMReset').onclick = () => { post({ t: 'fmbank', bank: builtinFMBank() }); $('stFM').textContent = 'Blasta Original FM'; };
+$('fileOP2').onchange = (e) => { const f = e.target.files[0]; if (f) loadOP2(f, f.name); e.target.value = ''; };
+for (const [id, core] of [['fileSF2a', 2], ['fileSF2b', 3]]) {
+  $(id).onchange = (e) => { const f = e.target.files[0]; if (f) loadUserSF2(f, f.name, core); e.target.value = ''; };
+  // flipping the budget box re-burns the saved bank the new way
+  $('budget' + core).onchange = async () => {
+    const saved = await store.get('sf' + core);
+    if (saved && ctx) loadUserSF2(saved.blob, saved.name, core, { save: true, jump: false });
+  };
+  $('reset' + core).onclick = async () => { await store.del('sf' + core); if (ctx) loadBuiltinSF2([BUDGET[core]]); };
+}
+$('btnFMReset').onclick = async () => {
+  await store.del('fm');
+  post({ t: 'fmbank', bank: builtinFMBank() }); $('stFM').textContent = 'Blasta Original FM';
+};
 
 // ------------------------------------------------------------ era
 const CHIPS = [['YM3812', '', 'SOUND BLASTER 2.0', '#1f6b35'], ['YMF262', 'CT1745', 'SOUND BLASTER 16', '#1f6b35'],
@@ -265,8 +323,8 @@ document.addEventListener('drop', async (e) => {
   if (!ctx) await powerOn();
   for (const f of e.dataTransfer.files) {
     const n = f.name.toLowerCase();
-    if (n.endsWith('.sf2')) await loadUserSF2(f, app.era >= 2.5 ? 3 : 2);
-    else if (n.endsWith('.op2')) await loadOP2(f);
+    if (n.endsWith('.sf2')) await loadUserSF2(f, f.name, app.era >= 2.5 ? 3 : 2);
+    else if (n.endsWith('.op2')) await loadOP2(f, f.name);
     else await openMidi(f);
   }
 });
