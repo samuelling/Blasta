@@ -134,6 +134,28 @@
         </div>
         <div class="progress"><div id="progBar"></div></div>
       </fieldset>
+
+      <!-- LOCKER -->
+      <fieldset class="group locker">
+        <legend>Bank Locker <small>(your own banks, password-protected, on every device)</small></legend>
+        <form class="row" id="lkLogin" autocomplete="on">
+          <input id="lkUrl" name="url" type="url" placeholder="https://blasta-locker.YOU.workers.dev" size="36" required>
+          <input id="lkPw" name="password" type="password" placeholder="password" autocomplete="current-password" size="16" required>
+          <label class="chk"><input type="checkbox" id="lkRemember" checked> Remember on this device</label>
+          <button class="btn small" type="submit">Unlock</button>
+        </form>
+        <div id="lkOpen" hidden>
+          <div class="row">
+            <label class="btn small" for="lkFile">Upload…</label>
+            <input type="file" id="lkFile" accept=".sf2,.op2" multiple hidden>
+            <button class="btn small" id="lkRefresh" type="button">Refresh</button>
+            <button class="btn small" id="lkLock" type="button">Lock</button>
+            <span id="lkInfo"></span>
+          </div>
+          <div id="lkList"></div>
+        </div>
+        <div class="lkstat" id="lkStat">Locked.</div>
+      </fieldset>
     </div>
 
     <div class="statusbar">
@@ -150,7 +172,7 @@
       <p><b>Blasta</b> plays General MIDI through four simulated generations of PC sound card. Drag the slider to age a song forward from AdLib FM to Sound Blaster Live!.</p>
       <p><b>FM eras</b> run a cycle-accurate YMF262 emulation (a JavaScript port of <a href="https://github.com/nukeykt/Nuked-OPL3" target="_blank" rel="noopener">Nuked OPL3</a> by Nuke.YKT, LGPL-2.1) at the chip's native 49,716 Hz. It is programmed through its registers like a period driver and fed through a 10-bit floating-point DAC model, with an original patch bank. You can load your own <code>.op2</code> bank (e.g. the free DMXOPL).</p>
       <p><b>Wavetable eras</b> use <a href="https://github.com/mrbumpy409/GeneralUser-GS" target="_blank" rel="noopener">GeneralUser GS</a> by S. Christian Collins (bundled locally under its license), burned down to an AWE32-ROM shape (22kHz mono, single velocity layer, sparse multisamples, tiny loops) or an early-Live! shape. Load your own <code>.sf2</code> into either slot — untick the budget box if it is already a period bank.</p>
-      <p>Banks you load are <b>saved in this browser</b> (never uploaded) and come back automatically next time. <b>Built-in</b> forgets them.</p>
+      <p>Banks you load are <b>saved in this browser</b> and come back automatically next time. <b>Built-in</b> forgets them. Unlock your <b>Bank Locker</b> (a private Cloudflare store, see <code>locker/README.md</code>) and they're also uploaded behind your password and follow you to every device.</p>
       <p>Drop <code>.mid</code>, <code>.sf2</code> or <code>.op2</code> files anywhere on the window.</p>
       <p class="fine">No Creative, E-mu, Yamaha or Microsoft data is included. Sound Blaster, AWE32 and Live! are trademarks of Creative Technology; names are used only to describe the eras being evoked.</p>
       <div class="row right"><button class="btn" id="aboutOK">OK</button></div>

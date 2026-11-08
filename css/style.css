@@ -1,3 +1,4 @@
+[hidden] { display: none !important; }
 :root {
   --face: #c0c0c0; --hi: #ffffff; --lo: #808080; --dk: #000000; --title: #000080;
   --desk: #008080; --lcd: #0c1a0c; --lcdfg: #4cff6a;
@@ -138,4 +139,22 @@ body.dragging .window#win { outline: 3px dashed var(--title); }
   .era-card { font-size: 15px; }
   .bankrow { grid-template-columns: 1fr auto; }
   .bankrow .bstat { grid-column: 1 / -1; order: 3; }
+}
+
+/* ---------- locker ---------- */
+.locker { grid-column: 1 / -1; }
+.locker input[type=url], .locker input[type=password] { background: #fff; border: 1px solid var(--dk); box-shadow: inset 1px 1px var(--lo); padding: 2px 4px; min-width: 0; }
+#lkList { background: #fff; box-shadow: inset 1px 1px var(--lo), inset -1px -1px var(--hi); max-height: 180px; overflow: auto; }
+.lkrow { display: grid; grid-template-columns: 1fr 70px 110px auto; gap: 8px; align-items: center; padding: 2px 6px; font-family: "Lucida Console", monospace; font-size: 11px; }
+.lkrow:nth-child(even) { background: #f0f0f0; }
+.lkname { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.lksize { text-align: right; } .lkin { color: var(--title); }
+.lkbtns { display: flex; gap: 3px; }
+.lkempty { padding: 6px; color: #606060; }
+.lkstat { margin-top: 4px; color: #303030; min-height: 1.3em; }
+#lkInfo { color: #404040; }
+@media (max-width: 760px) {
+  .lkrow { grid-template-columns: 1fr auto; }
+  .lkrow .lkin { grid-column: 1; } .lkrow .lkbtns { grid-column: 2; grid-row: 1 / span 2; }
+  .locker input[type=url] { width: 100%; }
 }

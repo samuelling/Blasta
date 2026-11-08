@@ -3,6 +3,7 @@ import { parseOP2 } from './op2.js';
 import { parseSMF } from './smf.js';
 import { demoSong } from './demo.js';
 import { GM_NAMES, ERAS } from './gm.js';
+import { Locker } from './locker.js';
 
 const $ = (id) => document.getElementById(id);
 const BUILTIN_SF2 = 'soundfonts/GeneralUser-GS.sf2';
@@ -116,16 +117,43 @@ const store = {
 const PIN = ' · 📌 saved in this browser';
 const BUDGET = { 2: 'awe', 3: 'live' };
 
-async function restoreSaved() {
-  const [fm, s2, s3] = await Promise.all([store.get('fm'), store.get('sf2'), store.get('sf3')]);
-  if (fm) await loadOP2(fm.blob, fm.name, { save: false });
+// ---- Bank Locker: password-protected cloud copies that follow you across devices ----
+const locker = new Locker();
+const SLOT_KEY = { fm: 'fm', 2: 'sf2', 3: 'sf3' };
+const SLOT_NAME = { fm: 'FM', sf2: 'AWE32', sf3: 'Live!' };
+
+async function pickSource(remote, local) {
+  // prefer the locker's assignment; reuse this device's cached copy if it is the same file
+  if (!remote) return local;
+  if (local && local.name === remote.name && local.etag && local.etag === remote.etag) return { ...local, budget: remote.budget ?? local.budget };
+  try {
+    lkStat(`Downloading ${remote.name} from the locker…`);
+    return { name: remote.name, etag: remote.etag, budget: remote.budget, blob: await locker.download(remote.name) };
+  } catch (err) { lkStat('Locker download failed (' + err.message + ') — using this device\'s copy.'); return local; }
+}
+
+async function restoreSaved({ remoteOnly = false } = {}) {
+  if (!remoteOnly && locker.configured) {
+    lkStat('Unlocking locker…');
+    if (await locker.resume()) lockerOpened();
+    else lkStat('Locker unreachable or password changed — using banks saved on this device.');
+  }
+  const cfg = locker.unlocked ? locker.config : {};
+  const [fmL, s2L, s3L] = await Promise.all([store.get('fm'), store.get('sf2'), store.get('sf3')]);
+  const fm = remoteOnly && !cfg.fm ? null : await pickSource(cfg.fm, fmL);
+  if (fm) await loadOP2(fm.blob, fm.name, { save: fm !== fmL, etag: fm.etag, sync: false });
   const need = [];
-  for (const [core, saved] of [[2, s2], [3, s3]]) {
-    if (saved) { $('budget' + core).checked = saved.budget !== 'raw'; await loadUserSF2(saved.blob, saved.name, core, { save: false, jump: false }); }
-    else need.push(BUDGET[core]);
+  for (const [core, local, remote] of [[2, s2L, cfg.sf2], [3, s3L, cfg.sf3]]) {
+    if (remoteOnly && !remote) continue;
+    const src = await pickSource(remote, local);
+    if (src) {
+      $('budget' + core).checked = src.budget !== 'raw';
+      await loadUserSF2(src.blob, src.name, core, { save: src !== local, jump: false, etag: src.etag, sync: false });
+    } else need.push(BUDGET[core]);
   }
   if (need.length) await loadBuiltinSF2(need);
-  else setStatus('All four cards ready (your saved banks).');
+  else if (!remoteOnly) setStatus('All four cards ready (your banks).');
+  if (locker.unlocked) lkStat('Unlocked.');
 }
 
 async function loadBuiltinSF2(budgets = ['awe', 'live']) {
@@ -158,25 +186,48 @@ async function saveBank(key, rec, statusEl) {
     statusEl.textContent += ' · not saved (' + (err.name === 'QuotaExceededError' ? 'browser storage full' : err.message) + ')';
   }
 }
-async function loadUserSF2(blob, name, core, { save = true, jump = true } = {}) {
+// push a slot's bank to the locker (upload if new) and record the assignment
+async function syncSlot(key, rec) {
+  if (!locker.unlocked) return;
+  try {
+    let etag = rec.etag;
+    if (!etag) {
+      if (rec.blob.size > 100 * 1048576) { lkStat(`${rec.name} is over 100 MB — too big for one upload; kept on this device only.`); return; }
+      const file = rec.blob instanceof File ? rec.blob : new File([rec.blob], rec.name);
+      const r = await locker.upload(file, (f) => { prog(f); lkStat(`Uploading ${rec.name}… ${Math.round(f * 100)}%`); });
+      prog(0);
+      etag = r.etag;
+      const local = await store.get(key);
+      if (local && local.name === rec.name) await store.put(key, { ...local, etag });
+    }
+    await locker.setSlot(key, { name: rec.name, etag, budget: rec.budget });
+    lkStat(`${rec.name} is in the locker and assigned to ${SLOT_NAME[key]}.`);
+    refreshLocker();
+  } catch (err) { lkStat('Locker sync failed: ' + err.message); }
+}
+async function loadUserSF2(blob, name, core, { save = true, jump = true, etag = null, sync = true } = {}) {
   const budget = $('budget' + core).checked ? BUDGET[core] : 'raw';
   $('st' + core).textContent = 'reading ' + name + '…';
   try {
     const r = await burn(await blob.arrayBuffer(), [budget], (s, p) => prog(p));
     installSF(core, r.banks[budget], name + (budget === 'raw' ? '' : budget === 'awe' ? ' → AWE-style' : ' → Live!-style'));
     prog(0);
-    if (save) await saveBank('sf' + core, { name, budget, blob }, $('st' + core));
+    const rec = { name, budget, blob, etag };
+    if (save) await saveBank('sf' + core, rec, $('st' + core));
     else $('st' + core).textContent += PIN;
     if (jump) setEra(core);
+    if (sync) syncSlot('sf' + core, rec);
   } catch (err) { $('st' + core).textContent = 'error: ' + err.message; }
 }
-async function loadOP2(blob, name, { save = true } = {}) {
+async function loadOP2(blob, name, { save = true, etag = null, sync = true } = {}) {
   try {
     const bank = parseOP2(await blob.arrayBuffer());
     post({ t: 'fmbank', bank });
     $('stFM').textContent = name;
-    if (save) { await saveBank('fm', { name, blob }, $('stFM')); if (app.era > 1.5) setEra(1); }
+    const rec = { name, blob, etag };
+    if (save) await saveBank('fm', rec, $('stFM'));
     else $('stFM').textContent += PIN;
+    if (sync) { if (app.era > 1.5) setEra(1); syncSlot('fm', rec); }
   } catch (err) { $('stFM').textContent = 'error: ' + err.message; }
 }
 $('fileOP2').onchange = (e) => { const f = e.target.files[0]; if (f) loadOP2(f, f.name); e.target.value = ''; };
@@ -185,14 +236,90 @@ for (const [id, core] of [['fileSF2a', 2], ['fileSF2b', 3]]) {
   // flipping the budget box re-burns the saved bank the new way
   $('budget' + core).onchange = async () => {
     const saved = await store.get('sf' + core);
-    if (saved && ctx) loadUserSF2(saved.blob, saved.name, core, { save: true, jump: false });
+    if (saved && ctx) loadUserSF2(saved.blob, saved.name, core, { save: true, jump: false, etag: saved.etag });
   };
-  $('reset' + core).onclick = async () => { await store.del('sf' + core); if (ctx) loadBuiltinSF2([BUDGET[core]]); };
+  $('reset' + core).onclick = async () => {
+    await store.del('sf' + core);
+    if (locker.unlocked) locker.setSlot('sf' + core, null).then(refreshLocker).catch(() => {});
+    if (ctx) loadBuiltinSF2([BUDGET[core]]);
+  };
 }
 $('btnFMReset').onclick = async () => {
   await store.del('fm');
+  if (locker.unlocked) locker.setSlot('fm', null).then(refreshLocker).catch(() => {});
   post({ t: 'fmbank', bank: builtinFMBank() }); $('stFM').textContent = 'Blasta Original FM';
 };
+
+// ---- locker panel ----
+function lkStat(s) { $('lkStat').textContent = s; }
+$('lkUrl').value = locker.url;
+$('lkLogin').onsubmit = async (e) => {
+  e.preventDefault();
+  const url = $('lkUrl').value.trim(), pw = $('lkPw').value;
+  if (!/^https:\/\//.test(url) && !/^http:\/\/localhost/.test(url)) { lkStat('Enter the https:// address of your locker Worker.'); return; }
+  lkStat('Unlocking…');
+  try {
+    await locker.unlock(url, pw, $('lkRemember').checked);
+    $('lkPw').value = '';
+    lockerOpened();
+    lkStat('Unlocked.');
+    if (ctx) restoreSaved({ remoteOnly: true });
+  } catch (err) { lkStat(err.message === 'wrong password' ? 'Wrong password.' : 'Could not reach the locker: ' + err.message); }
+};
+$('lkLock').onclick = () => { locker.lock(); $('lkOpen').hidden = true; $('lkLogin').hidden = false; lkStat('Locked. Banks already loaded stay on this device.'); };
+$('lkRefresh').onclick = () => refreshLocker();
+$('lkFile').onchange = async (e) => {
+  for (const f of e.target.files) {
+    if (f.size > 100 * 1048576) { lkStat(`${f.name} is over 100 MB — too big for one upload.`); continue; }
+    try { await locker.upload(f, (p) => { prog(p); lkStat(`Uploading ${f.name}… ${Math.round(p * 100)}%`); }); lkStat(`Uploaded ${f.name}.`); }
+    catch (err) { lkStat(`Upload of ${f.name} failed: ${err.message}`); }
+  }
+  prog(0); e.target.value = ''; refreshLocker();
+};
+function lockerOpened() { $('lkLogin').hidden = true; $('lkOpen').hidden = false; refreshLocker(); }
+async function refreshLocker() {
+  if (!locker.unlocked) return;
+  let banks;
+  try { banks = await locker.list(); } catch (err) { lkStat('Could not list banks: ' + err.message); return; }
+  const cfg = locker.config, box = $('lkList');
+  box.innerHTML = '';
+  if (!banks.length) box.innerHTML = '<div class="lkempty">Empty — upload .sf2 / .op2 files, or just load one into a slot above.</div>';
+  let total = 0;
+  for (const b of banks) {
+    total += b.size;
+    const row = document.createElement('div'); row.className = 'lkrow';
+    const inSlots = Object.entries(cfg).filter(([, v]) => v && v.name === b.name).map(([k]) => SLOT_NAME[k]);
+    row.innerHTML = `<span class="lkname"></span><span class="lksize">${mb(b.size)}</span><span class="lkin">${inSlots.length ? '● ' + inSlots.join(', ') : ''}</span><span class="lkbtns"></span>`;
+    row.querySelector('.lkname').textContent = b.name;
+    const btns = row.querySelector('.lkbtns');
+    const add = (label, fn, title) => { const x = document.createElement('button'); x.className = 'btn small'; x.textContent = label; x.title = title || ''; x.onclick = fn; btns.appendChild(x); };
+    if (b.kind === 'op2') add('→ FM', () => assign(b, 'fm'), 'Use for the AdLib / SB16 cards');
+    else { add('→ AWE32', () => assign(b, 2), 'Load into the AWE32 slot'); add('→ Live!', () => assign(b, 3), 'Load into the Live! slot'); }
+    add('✕', async () => {
+      if (!confirm(`Delete ${b.name} from the locker? (Copies already loaded on devices stay there.)`)) return;
+      try {
+        await locker.remove(b.name);
+        for (const [k, v] of Object.entries(cfg)) if (v && v.name === b.name) await locker.setSlot(k, null);
+        refreshLocker();
+      } catch (err) { lkStat('Delete failed: ' + err.message); }
+    }, 'Delete from the locker');
+    box.appendChild(row);
+  }
+  $('lkInfo').textContent = banks.length ? `${banks.length} bank${banks.length > 1 ? 's' : ''} · ${mb(total)}` : '';
+}
+async function assign(b, slot) {
+  if (!ctx) await powerOn();
+  const key = SLOT_KEY[slot];
+  const local = await store.get(key);
+  let blob;
+  if (local && local.name === b.name && local.etag === b.etag) blob = local.blob;
+  else {
+    lkStat(`Downloading ${b.name}…`);
+    try { blob = await locker.download(b.name); } catch (err) { lkStat('Download failed: ' + err.message); return; }
+  }
+  if (slot === 'fm') await loadOP2(blob, b.name, { etag: b.etag });
+  else await loadUserSF2(blob, b.name, slot, { etag: b.etag });
+}
 
 // ------------------------------------------------------------ era
 const CHIPS = [['YM3812', '', 'SOUND BLASTER 2.0', '#1f6b35'], ['YMF262', 'CT1745', 'SOUND BLASTER 16', '#1f6b35'],
