@@ -158,3 +158,10 @@ body.dragging .window#win { outline: 3px dashed var(--title); }
   .lkrow .lkin { grid-column: 1; } .lkrow .lkbtns { grid-column: 2; grid-row: 1 / span 2; }
   .locker input[type=url] { width: 100%; }
 }
+
+.lkrow { grid-template-columns: 1fr 70px 120px auto auto; }
+.lkpub { font-family: var(--ui); }
+#shelfList { background: #fff; box-shadow: inset 1px 1px var(--lo), inset -1px -1px var(--hi); max-height: 180px; overflow: auto; }
+#shelfList .lkrow { grid-template-columns: 1fr 70px 150px auto; }
+.shelfhead { margin: 8px 0 3px; font-weight: bold; }
+.shelfhead small { font-weight: normal; color: #404040; }

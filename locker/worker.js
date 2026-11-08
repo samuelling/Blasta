@@ -6,10 +6,17 @@
 //   PUT    /banks/:name      upload (raw body)
 //   GET    /banks/:name      download
 //   DELETE /banks/:name      delete
-//   GET    /config           which bank is in which Blasta slot
+//   GET    /config           which bank is in which Blasta slot (owner's devices)
 //   PUT    /config           save slot assignments (JSON)
+//   PUT    /public           owner: { banks: [names], slots: { fm, sf2, sf3 } } — what visitors get
+//
+// Public, read-only (no password):
+//   GET    /public                 public banks + the site's default slots
+//   GET    /public/banks/:name     download a bank the owner marked public
 
 const CONFIG_KEY = '_config.json';
+const PUBLIC_KEY = '_public.json';
+const SLOTS = ['fm', 'sf2', 'sf3'];
 const MAX_NAME = 120;
 
 export default {
@@ -29,21 +36,59 @@ export default {
 
     if (req.method === 'OPTIONS') return reply(null, 204);
     if (origin && !allowed.includes(origin)) return json({ error: 'origin not allowed' }, 403);
+    const url = new URL(req.url);
+    const path = decodeURIComponent(url.pathname);
+
+    // ---- public, read-only ----
+    if (req.method === 'GET' && (path === '/public' || path.startsWith('/public/banks/'))) {
+      const pub = await readPublic(env);
+      if (path === '/public') {
+        const banks = [];
+        for (const name of pub.banks) {
+          const h = await env.BANKS.head(name);
+          if (h) banks.push({ name, size: h.size, etag: h.httpEtag, kind: kindOf(name) });
+        }
+        const live = Object.fromEntries(banks.map(b => [b.name, b]));
+        const slots = {};
+        for (const k of SLOTS) {
+          const s = pub.slots[k];
+          if (s && live[s.name]) slots[k] = { name: s.name, etag: live[s.name].etag, budget: s.budget };
+        }
+        return json({ banks, slots }, 200);
+      }
+      const name = path.slice('/public/banks/'.length);
+      if (!pub.banks.includes(name)) return json({ error: 'not found' }, 404);
+      const o = await env.BANKS.get(name);
+      if (!o) return json({ error: 'not found' }, 404);
+      return reply(o.body, 200, { 'Content-Type': 'application/octet-stream', 'Content-Length': String(o.size), ETag: o.httpEtag, 'Cache-Control': 'public, max-age=300' });
+    }
+
+    // ---- everything else needs the password ----
     if (!env.LOCKER_PASSWORD) return json({ error: 'locker password not configured' }, 500);
     if (!(await authorized(req, env.LOCKER_PASSWORD))) {
       await new Promise(r => setTimeout(r, 400));          // slow down guessing
       return json({ error: 'wrong password' }, 401);
     }
 
-    const url = new URL(req.url);
-    const path = decodeURIComponent(url.pathname);
+    if (path === '/public' && req.method === 'PUT') {
+      let body;
+      try { body = JSON.parse(await req.text()); } catch { return json({ error: 'bad json' }, 400); }
+      const banks = [...new Set((body.banks || []).filter(n => typeof n === 'string' && validName(n)))].slice(0, 500);
+      const slots = {};
+      for (const k of SLOTS) {
+        const s = body.slots && body.slots[k];
+        if (s && typeof s.name === 'string' && banks.includes(s.name)) slots[k] = { name: s.name, budget: s.budget === 'raw' ? 'raw' : (k === 'sf2' ? 'awe' : k === 'sf3' ? 'live' : undefined) };
+      }
+      await env.BANKS.put(PUBLIC_KEY, JSON.stringify({ banks, slots }), { httpMetadata: { contentType: 'application/json' } });
+      return json({ ok: true, banks, slots });
+    }
 
     if (path === '/banks' && req.method === 'GET') {
       const out = [];
       let cursor;
       do {
         const page = await env.BANKS.list({ cursor, include: ['customMetadata'] });
-        for (const o of page.objects) if (o.key !== CONFIG_KEY) out.push({ name: o.key, size: o.size, etag: o.httpEtag, uploaded: o.uploaded, kind: kindOf(o.key) });
+        for (const o of page.objects) if (!o.key.startsWith('_')) out.push({ name: o.key, size: o.size, etag: o.httpEtag, uploaded: o.uploaded, kind: kindOf(o.key) });
         cursor = page.truncated ? page.cursor : undefined;
       } while (cursor);
       out.sort((a, b) => a.name.localeCompare(b.name));
@@ -80,6 +125,12 @@ export default {
       }
       if (req.method === 'DELETE') {
         await env.BANKS.delete(name);
+        const pub = await readPublic(env);           // a deleted bank stops being public
+        if (pub.banks.includes(name)) {
+          pub.banks = pub.banks.filter(n => n !== name);
+          for (const k of SLOTS) if (pub.slots[k] && pub.slots[k].name === name) delete pub.slots[k];
+          await env.BANKS.put(PUBLIC_KEY, JSON.stringify(pub), { httpMetadata: { contentType: 'application/json' } });
+        }
         return json({ ok: true });
       }
     }
@@ -98,7 +149,12 @@ async function authorized(req, secret) {
   let d = 0; for (let i = 0; i < x.length; i++) d |= x[i] ^ y[i];
   return d === 0;
 }
+async function readPublic(env) {
+  const o = await env.BANKS.get(PUBLIC_KEY);
+  const p = o ? await o.json().catch(() => ({})) : {};
+  return { banks: Array.isArray(p.banks) ? p.banks : [], slots: p.slots || {} };
+}
 function validName(n) {
-  return n.length <= MAX_NAME && n !== CONFIG_KEY && !/[\/\\\x00-\x1f]/.test(n) && !n.startsWith('.') && /\.(sf2|op2)$/i.test(n);
+  return n.length <= MAX_NAME && !n.startsWith('_') && !/[\/\\\x00-\x1f]/.test(n) && !n.startsWith('.') && /\.(sf2|op2)$/i.test(n);
 }
 function kindOf(n) { return /\.op2$/i.test(n) ? 'op2' : 'sf2'; }

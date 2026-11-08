@@ -7,6 +7,24 @@ This is a private, password-protected home for your own `.sf2` / `.op2` banks. I
 
 Every request (listing, upload, download, delete) needs the password. The password exists only as an encrypted Worker secret, and the bucket is never public. The Worker only accepts calls from the sites listed in `ALLOWED_ORIGINS`.
 
+## Sharing with visitors (read-only)
+
+Everything in the locker is private until you share it:
+
+- **Public** checkbox on a bank: anyone who opens Blasta sees it on the *Public banks* shelf and can load it into their own slots. They can't change, delete or replace it.
+- **Publish my slots as site default**: the banks currently in your slots become what every visitor hears by default, instead of the built-in banks. Publishing makes those banks public, and the confirmation dialog lists exactly which ones.
+
+Visitors can always load their own `.sf2` / `.op2` files. Those stay in their own browser and are never uploaded. Only an unlocked locker uploads anything.
+
+What each device gets per slot, in order of priority:
+
+1. On a device where you've unlocked, your own locker assignment.
+2. That browser's own choice.
+3. Your published site default.
+4. The built-in banks.
+
+Only share banks you made or that are freely licensed. A public bank can be downloaded by anyone.
+
 ## One-time setup
 
 From this folder, logged in to your Cloudflare account:

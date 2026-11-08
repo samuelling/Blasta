@@ -3,7 +3,7 @@ import { parseOP2 } from './op2.js';
 import { parseSMF } from './smf.js';
 import { demoSong } from './demo.js';
 import { GM_NAMES, ERAS } from './gm.js';
-import { Locker } from './locker.js';
+import { Locker, DEFAULT_LOCKER } from './locker.js';
 
 const $ = (id) => document.getElementById(id);
 const BUILTIN_SF2 = 'soundfonts/GeneralUser-GS.sf2';
@@ -115,6 +115,7 @@ const store = {
   del(k) { return this.op('readwrite', s => s.delete(k)).catch(() => {}); },
 };
 const PIN = ' · 📌 saved in this browser';
+const SITE = ' · 🌐 site default';
 const BUDGET = { 2: 'awe', 3: 'live' };
 
 // ---- Bank Locker: password-protected cloud copies that follow you across devices ----
@@ -132,28 +133,48 @@ async function pickSource(remote, local) {
   } catch (err) { lkStat('Locker download failed (' + err.message + ') — using this device\'s copy.'); return local; }
 }
 
+async function publicSource(entry, local) {
+  // the site's default bank for a slot; cached on this device (marked pub) so it downloads once
+  if (!entry) return null;
+  if (local && local.pub && local.name === entry.name && local.etag === entry.etag) return { ...local, budget: entry.budget ?? local.budget };
+  try {
+    lkStat(`Fetching the site's ${entry.name}…`);
+    return { name: entry.name, etag: entry.etag, budget: entry.budget, pub: true, blob: await locker.publicDownload(entry.name) };
+  } catch { return null; }
+}
+
 async function restoreSaved({ remoteOnly = false } = {}) {
   if (!remoteOnly && locker.configured) {
     lkStat('Unlocking locker…');
     if (await locker.resume()) lockerOpened();
     else lkStat('Locker unreachable or password changed — using banks saved on this device.');
   }
+  if (!remoteOnly) { try { await locker.publicInfo(); } catch {} renderShelf(); }
   const cfg = locker.unlocked ? locker.config : {};
+  const pubSlots = (locker.pub && locker.pub.slots) || {};
   const [fmL, s2L, s3L] = await Promise.all([store.get('fm'), store.get('sf2'), store.get('sf3')]);
-  const fm = remoteOnly && !cfg.fm ? null : await pickSource(cfg.fm, fmL);
-  if (fm) await loadOP2(fm.blob, fm.name, { save: fm !== fmL, etag: fm.etag, sync: false });
+  // precedence: the owner's own assignment > this device's own choice > the site default > built-in
+  const resolve = async (remote, local, pubEntry) => {
+    if (remote) return pickSource(remote, local);
+    if (local && !local.pub) return local;
+    return (await publicSource(pubEntry, local)) || null;
+  };
+  if (!(remoteOnly && !cfg.fm)) {
+    const fm = await resolve(cfg.fm, fmL, pubSlots.fm);
+    if (fm) await loadOP2(fm.blob, fm.name, { save: fm !== fmL, etag: fm.etag, sync: false, pub: fm.pub });
+  }
   const need = [];
-  for (const [core, local, remote] of [[2, s2L, cfg.sf2], [3, s3L, cfg.sf3]]) {
+  for (const [core, local, remote, pubEntry] of [[2, s2L, cfg.sf2, pubSlots.sf2], [3, s3L, cfg.sf3, pubSlots.sf3]]) {
     if (remoteOnly && !remote) continue;
-    const src = await pickSource(remote, local);
+    const src = await resolve(remote, local, pubEntry);
     if (src) {
       $('budget' + core).checked = src.budget !== 'raw';
-      await loadUserSF2(src.blob, src.name, core, { save: src !== local, jump: false, etag: src.etag, sync: false });
+      await loadUserSF2(src.blob, src.name, core, { save: src !== local, jump: false, etag: src.etag, sync: false, pub: src.pub });
     } else need.push(BUDGET[core]);
   }
   if (need.length) await loadBuiltinSF2(need);
-  else if (!remoteOnly) setStatus('All four cards ready (your banks).');
-  if (locker.unlocked) lkStat('Unlocked.');
+  else if (!remoteOnly) setStatus('All four cards ready.');
+  lkStat(locker.unlocked ? 'Unlocked.' : (locker.pub.banks.length ? 'Public banks available below. Unlock to manage.' : 'Locked.'));
 }
 
 async function loadBuiltinSF2(budgets = ['awe', 'live']) {
@@ -177,18 +198,18 @@ function installSF(core, bank, label) {
   post({ t: 'sfbank', core, bank }, [bank.pool.buffer]);
   $('st' + core).textContent = `${label} · ${mb(bytes)} of samples`;
 }
-async function saveBank(key, rec, statusEl) {
+async function saveBank(key, rec, statusEl, pub = false) {
   try {
     if (navigator.storage && navigator.storage.persist) navigator.storage.persist();   // ask the browser not to evict it
     await store.put(key, rec);
-    statusEl.textContent += PIN;
+    statusEl.textContent += pub ? SITE : PIN;
   } catch (err) {
     statusEl.textContent += ' · not saved (' + (err.name === 'QuotaExceededError' ? 'browser storage full' : err.message) + ')';
   }
 }
 // push a slot's bank to the locker (upload if new) and record the assignment
 async function syncSlot(key, rec) {
-  if (!locker.unlocked) return;
+  if (!locker.unlocked || rec.pub) return;
   try {
     let etag = rec.etag;
     if (!etag) {
@@ -205,28 +226,28 @@ async function syncSlot(key, rec) {
     refreshLocker();
   } catch (err) { lkStat('Locker sync failed: ' + err.message); }
 }
-async function loadUserSF2(blob, name, core, { save = true, jump = true, etag = null, sync = true } = {}) {
+async function loadUserSF2(blob, name, core, { save = true, jump = true, etag = null, sync = true, pub = false } = {}) {
   const budget = $('budget' + core).checked ? BUDGET[core] : 'raw';
   $('st' + core).textContent = 'reading ' + name + '…';
   try {
     const r = await burn(await blob.arrayBuffer(), [budget], (s, p) => prog(p));
     installSF(core, r.banks[budget], name + (budget === 'raw' ? '' : budget === 'awe' ? ' → AWE-style' : ' → Live!-style'));
     prog(0);
-    const rec = { name, budget, blob, etag };
-    if (save) await saveBank('sf' + core, rec, $('st' + core));
-    else $('st' + core).textContent += PIN;
+    const rec = { name, budget, blob, etag, pub };
+    if (save) await saveBank('sf' + core, rec, $('st' + core), pub);
+    else $('st' + core).textContent += pub ? SITE : PIN;
     if (jump) setEra(core);
     if (sync) syncSlot('sf' + core, rec);
   } catch (err) { $('st' + core).textContent = 'error: ' + err.message; }
 }
-async function loadOP2(blob, name, { save = true, etag = null, sync = true } = {}) {
+async function loadOP2(blob, name, { save = true, etag = null, sync = true, pub = false } = {}) {
   try {
     const bank = parseOP2(await blob.arrayBuffer());
     post({ t: 'fmbank', bank });
     $('stFM').textContent = name;
-    const rec = { name, blob, etag };
-    if (save) await saveBank('fm', rec, $('stFM'));
-    else $('stFM').textContent += PIN;
+    const rec = { name, blob, etag, pub };
+    if (save) await saveBank('fm', rec, $('stFM'), pub);
+    else $('stFM').textContent += pub ? SITE : PIN;
     if (sync) { if (app.era > 1.5) setEra(1); syncSlot('fm', rec); }
   } catch (err) { $('stFM').textContent = 'error: ' + err.message; }
 }
@@ -240,19 +261,24 @@ for (const [id, core] of [['fileSF2a', 2], ['fileSF2b', 3]]) {
   };
   $('reset' + core).onclick = async () => {
     await store.del('sf' + core);
-    if (locker.unlocked) locker.setSlot('sf' + core, null).then(refreshLocker).catch(() => {});
-    if (ctx) loadBuiltinSF2([BUDGET[core]]);
+    if (locker.unlocked) await locker.setSlot('sf' + core, null).then(refreshLocker).catch(() => {});
+    if (!ctx) return;
+    const def = await publicSource(locker.pub.slots && locker.pub.slots['sf' + core], null);
+    if (def) { $('budget' + core).checked = def.budget !== 'raw'; loadUserSF2(def.blob, def.name, core, { jump: false, etag: def.etag, sync: false, pub: true }); }
+    else loadBuiltinSF2([BUDGET[core]]);
   };
 }
 $('btnFMReset').onclick = async () => {
   await store.del('fm');
-  if (locker.unlocked) locker.setSlot('fm', null).then(refreshLocker).catch(() => {});
-  post({ t: 'fmbank', bank: builtinFMBank() }); $('stFM').textContent = 'Blasta Original FM';
+  if (locker.unlocked) await locker.setSlot('fm', null).then(refreshLocker).catch(() => {});
+  const def = ctx && await publicSource(locker.pub.slots && locker.pub.slots.fm, null);
+  if (def) loadOP2(def.blob, def.name, { etag: def.etag, sync: false, pub: true });
+  else { post({ t: 'fmbank', bank: builtinFMBank() }); $('stFM').textContent = 'Blasta Original FM'; }
 };
 
 // ---- locker panel ----
 function lkStat(s) { $('lkStat').textContent = s; }
-$('lkUrl').value = locker.url;
+$('lkUrl').value = locker.url || DEFAULT_LOCKER;
 $('lkLogin').onsubmit = async (e) => {
   e.preventDefault();
   const url = $('lkUrl').value.trim(), pw = $('lkPw').value;
@@ -289,7 +315,9 @@ async function refreshLocker() {
     total += b.size;
     const row = document.createElement('div'); row.className = 'lkrow';
     const inSlots = Object.entries(cfg).filter(([, v]) => v && v.name === b.name).map(([k]) => SLOT_NAME[k]);
-    row.innerHTML = `<span class="lkname"></span><span class="lksize">${mb(b.size)}</span><span class="lkin">${inSlots.length ? '● ' + inSlots.join(', ') : ''}</span><span class="lkbtns"></span>`;
+    const isPub = locker.pub.banks.some(p => p.name === b.name);
+    row.innerHTML = `<span class="lkname"></span><span class="lksize">${mb(b.size)}</span><span class="lkin">${inSlots.length ? '● ' + inSlots.join(', ') : ''}</span><label class="chk lkpub" title="Anyone visiting Blasta can load this bank (read-only)"><input type="checkbox" ${isPub ? 'checked' : ''}> Public</label><span class="lkbtns"></span>`;
+    row.querySelector('.lkpub input').onchange = (e) => togglePublic(b.name, e.target.checked, e.target);
     row.querySelector('.lkname').textContent = b.name;
     const btns = row.querySelector('.lkbtns');
     const add = (label, fn, title) => { const x = document.createElement('button'); x.className = 'btn small'; x.textContent = label; x.title = title || ''; x.onclick = fn; btns.appendChild(x); };
@@ -306,6 +334,59 @@ async function refreshLocker() {
     box.appendChild(row);
   }
   $('lkInfo').textContent = banks.length ? `${banks.length} bank${banks.length > 1 ? 's' : ''} · ${mb(total)}` : '';
+  renderShelf();
+}
+function pubState() {
+  return { banks: locker.pub.banks.map(b => b.name), slots: { ...(locker.pub.slots || {}) } };
+}
+async function togglePublic(name, on, box) {
+  const st = pubState();
+  st.banks = on ? [...new Set([...st.banks, name])] : st.banks.filter(n => n !== name);
+  if (!on) for (const k of Object.keys(st.slots)) if (st.slots[k].name === name) delete st.slots[k];
+  try { await locker.setPublic(st); lkStat(on ? `${name} is now public (read-only for visitors).` : `${name} is private again.`); }
+  catch (err) { box.checked = !on; lkStat('Could not change sharing: ' + err.message); }
+  renderShelf();
+}
+$('lkPublish').onclick = async () => {
+  const cfg = locker.config, st = pubState(), chosen = [];
+  for (const k of ['fm', 'sf2', 'sf3']) {
+    if (cfg[k]) { st.slots[k] = { name: cfg[k].name, budget: cfg[k].budget }; chosen.push(`${SLOT_NAME[k]}: ${cfg[k].name}`); if (!st.banks.includes(cfg[k].name)) st.banks.push(cfg[k].name); }
+    else delete st.slots[k];
+  }
+  const msg = chosen.length
+    ? `Make these the default sound for everyone who opens Blasta?\n\n${chosen.join('\n')}\n\nThese banks become public (downloadable, read-only). Empty slots go back to the built-in banks.`
+    : 'None of your slots use locker banks, so this resets the site to the built-in banks. Continue?';
+  if (!confirm(msg)) return;
+  try { await locker.setPublic(st); lkStat(chosen.length ? 'Published — visitors now get your banks by default.' : 'Site defaults reset to the built-in banks.'); refreshLocker(); }
+  catch (err) { lkStat('Publish failed: ' + err.message); }
+};
+
+// ---- public shelf: anyone can load these into their own browser, no one can change them ----
+function renderShelf() {
+  const box = $('shelfList'), banks = (locker.pub && locker.pub.banks) || [];
+  $('shelf').hidden = !banks.length;
+  box.innerHTML = '';
+  const defs = (locker.pub && locker.pub.slots) || {};
+  for (const b of banks) {
+    const row = document.createElement('div'); row.className = 'lkrow';
+    const isDef = Object.entries(defs).filter(([, v]) => v && v.name === b.name).map(([k]) => SLOT_NAME[k]);
+    row.innerHTML = `<span class="lkname"></span><span class="lksize">${mb(b.size)}</span><span class="lkin">${isDef.length ? '★ default ' + isDef.join(', ') : ''}</span><span class="lkbtns"></span>`;
+    row.querySelector('.lkname').textContent = b.name;
+    const btns = row.querySelector('.lkbtns');
+    const add = (label, slot) => { const x = document.createElement('button'); x.className = 'btn small'; x.textContent = label; x.onclick = () => takePublic(b, slot); btns.appendChild(x); };
+    if (b.kind === 'op2') add('→ FM', 'fm'); else { add('→ AWE32', 2); add('→ Live!', 3); }
+    box.appendChild(row);
+  }
+}
+async function takePublic(b, slot) {
+  if (!ctx) await powerOn();
+  lkStat(`Fetching ${b.name}…`);
+  let blob;
+  try { blob = await locker.publicDownload(b.name); } catch (err) { lkStat('Download failed: ' + err.message); return; }
+  // the visitor's own choice for this browser; for the owner (unlocked) it also syncs to their locker slot
+  const opts = { etag: b.etag, pub: false };
+  if (slot === 'fm') await loadOP2(blob, b.name, opts); else await loadUserSF2(blob, b.name, slot, opts);
+  lkStat(`${b.name} loaded.`);
 }
 async function assign(b, slot) {
   if (!ctx) await powerOn();
